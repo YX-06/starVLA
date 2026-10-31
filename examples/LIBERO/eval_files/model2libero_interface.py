@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
+from examples.attention_analysis.client_trace import ChunkTrace
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
 
 
@@ -72,21 +73,22 @@ class ModelClient:
         self.task_description = None
         self.image_history = deque(maxlen=self.horizon)
         if self.action_ensemble:
-            self.action_ensembler = AdaptiveEnsembler(
-                self.action_ensemble_horizon, self.adaptive_ensemble_alpha
-            )
+            self.action_ensembler = AdaptiveEnsembler(self.action_ensemble_horizon, self.adaptive_ensemble_alpha)
         else:
             self.action_ensembler = None
         self.num_image_history = 0
 
         # Cached unnormalized chunk; refreshed every `action_chunk_size` steps.
         self.raw_actions: Optional[np.ndarray] = None
+        self.last_inference_requested = False
+        self._trace = ChunkTrace()
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
 
-    def reset(self, task_description: str) -> None:
+    def reset(self, task_description: str, task_suite=None, task_id=None, episode_idx=None) -> None:
+        self._trace.reset(task_suite, task_id, episode_idx)
         self.task_description = task_description
         self.image_history.clear()
         if self.action_ensemble:
@@ -97,6 +99,7 @@ class ModelClient:
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
         self.raw_actions = None
+        self.last_inference_requested = False
 
     def step(self, example: dict, step: int = 0, **kwargs) -> dict:
         """One env step.
@@ -112,40 +115,42 @@ class ModelClient:
         if task_description != self.task_description:
             self.reset(task_description)
 
-        # Resize images to self.image_size if needed.
-        if self.image_size and example.get("image"):
-            resized = []
-            target_hw = self.image_size  # (H, W)
-            for img in example["image"]:
-                arr = np.asarray(img)
-                if arr.shape[:2] != target_hw:
-                    arr = np.asarray(
-                        Image.fromarray(arr).resize(
-                            (target_hw[1], target_hw[0]), Image.BILINEAR
-                        )
-                    )
-                resized.append(arr)
-            example = {**example, "image": resized}
-
         # Refresh chunk if needed.
-        if step % self.action_chunk_size == 0 or self.raw_actions is None:
+        self.last_inference_requested = step % self.action_chunk_size == 0 or self.raw_actions is None
+        if self.last_inference_requested:
+            # Cached actions consume no image. Prepare owned snapshots only for a real request.
+            if example.get("image"):
+                resized = []
+                for img in example["image"]:
+                    arr = np.asarray(img)
+                    if self.image_size and arr.shape[:2] != self.image_size:
+                        arr = np.asarray(
+                            Image.fromarray(arr).resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
+                        )
+                    resized.append(np.array(arr, copy=True, order="C"))
+                example = {**example, "image": resized}
             vla_input = {
                 "examples": [example],
                 "unnorm_key": self.unnorm_key,
                 "do_sample": False,
                 "use_ddim": self.use_ddim,
                 "num_ddim_steps": self.num_ddim_steps,
+                "trace_context": self._trace.context(
+                    task_description, step, ["primary", "wrist"], example.get("image_transforms")
+                ),
             }
             response = self.client.predict_action(vla_input)
             try:
                 actions_batch = response["data"]["actions"]  # (B, T, D), unnormalized server-side
-            except KeyError:
+            except KeyError as error:
                 raise KeyError(
                     f"Key 'actions' not found in response data: keys={list(response.get('data', {}).keys())}, "
                     f"full response={response}"
-                )
+                ) from error
             self.raw_actions = np.asarray(actions_batch)[0]  # (T, D)
+            self._trace.received(response["data"], step)
 
+        self._trace.executed(step, step % self.action_chunk_size)
         raw_actions = self.raw_actions[step % self.action_chunk_size][None]
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),

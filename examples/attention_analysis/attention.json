@@ -1,0 +1,7 @@
+{
+  "output_dir": "playground/attention_analysis/runs/traces",
+  "layers": null,
+  "denoise_steps": null,
+  "action_queries": null,
+  "interval": 1
+}

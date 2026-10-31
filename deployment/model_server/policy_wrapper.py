@@ -21,16 +21,17 @@ Exposed API:
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 
+from deployment.model_server.policy_norm_processor import PolicyNormProcessor
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import read_mode_config
-
-from deployment.model_server.policy_norm_processor import PolicyNormProcessor
 
 
 class PolicyServerWrapper:
@@ -42,6 +43,7 @@ class PolicyServerWrapper:
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
+        attention_config: Optional[str] = None,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
 
@@ -51,6 +53,15 @@ class PolicyServerWrapper:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
         self._framework = framework
+        self._attention_recorder = None
+        if attention_config is not None:
+            from starVLA.model.analysis.attention import AttentionRecorder
+
+            provenance = {"checkpoint": self._ckpt_path}
+            revision_file = Path(self._ckpt_path).parents[1] / "revision.json"
+            if revision_file.exists():
+                provenance.update(json.loads(revision_file.read_text()))
+            self._attention_recorder = AttentionRecorder(attention_config, provenance=provenance)
 
         # Co-located metadata.
         model_cfg, _ = read_mode_config(self._ckpt_path)
@@ -58,14 +69,15 @@ class PolicyServerWrapper:
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]
-        
+
         if "action_horizon" in action_model_cfg:
             self._action_chunk_size = int(action_model_cfg["action_horizon"])
         elif "future_action_window_size" in action_model_cfg:
             self._action_chunk_size = int(action_model_cfg["future_action_window_size"]) + 1
         else:
             raise ValueError(
-                f"PolicyServerWrapper: no action_horizon or future_action_window_size found in model config for {self._ckpt_path}"
+                "PolicyServerWrapper: no action_horizon or future_action_window_size found "
+                f"in model config for {self._ckpt_path}"
             )
         # Cache of PolicyNormProcessor instances per unnorm_key.
         # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
@@ -101,9 +113,7 @@ class PolicyServerWrapper:
     def _get_processor(self, unnorm_key: Optional[str]) -> PolicyNormProcessor:
         cache_key = unnorm_key if unnorm_key is not None else "__default__"
         if cache_key not in self._norm_processors:
-            self._norm_processors[cache_key] = PolicyNormProcessor(
-                self._ckpt_path, unnorm_key=unnorm_key
-            )
+            self._norm_processors[cache_key] = PolicyNormProcessor(self._ckpt_path, unnorm_key=unnorm_key)
         return self._norm_processors[cache_key]
 
     @property
@@ -127,6 +137,7 @@ class PolicyServerWrapper:
         self,
         examples: List[dict],
         unnorm_key: Optional[str] = None,
+        trace_context: Optional[dict] = None,
         **kwargs,
     ) -> Dict[str, np.ndarray]:
         """Run the framework, then un-normalize via training-time transforms.
@@ -152,11 +163,23 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
-        out = self._framework.predict_action(examples=examples, **kwargs)
+        trace_id = None
+        if self._attention_recorder is None:
+            out = self._framework.predict_action(examples=examples, **kwargs)
+        else:
+            if int(kwargs.get("diffusion_samples", 1)) != 1:
+                raise ValueError("Attention export requires diffusion_samples=1")
+            with self._attention_recorder.session(self._framework, examples, trace_context) as session:
+                out = self._framework.predict_action(examples=examples, **kwargs)
+                if session is not None:
+                    trace_id = session.save()
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
         unnorm = np.stack(
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        result = {"actions": unnorm}
+        if trace_id is not None:
+            result["trace_id"] = trace_id
+        return result

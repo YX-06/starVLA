@@ -18,10 +18,20 @@ def main(args) -> None:
     eval clients (LIBERO / SimplerEnv / etc.) just need to forward `examples`
     and consume already-unnormalized actions from the response.
     """
+    if args.seed is not None:
+        import random
+
+        import numpy as np
+        import torch
+
+        random.seed(args.seed)
+        np.random.seed(args.seed % (2**32))
+        torch.manual_seed(args.seed)
     wrapper = PolicyServerWrapper(
         ckpt_path=args.ckpt_path,
         device="cuda",
         use_bf16=args.use_bf16,
+        attention_config=args.attention_config,
     )
 
     hostname = socket.gethostname()
@@ -45,6 +55,8 @@ def build_argparser():
     parser.add_argument("--ckpt_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
+    parser.add_argument("--attention-config", type=str, default=None, help="Optional attention export JSON config")
+    parser.add_argument("--seed", type=int, default=None, help="Optional reproducible policy RNG seed")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
     return parser
 
